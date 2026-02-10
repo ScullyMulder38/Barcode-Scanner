@@ -1,0 +1,447 @@
+substitutions:
+  name: "barcode-scanner"
+  friendly_name: "Barcode Scanner"
+  uart_tx_pin: GPIO41
+  uart_rx_pin: GPIO42
+  display_led_pin: GPIO06
+
+
+esphome:
+  name: barcode-scanner
+  friendly_name: Barcode Scanner
+  platformio_options: 
+    board_build.arduino.memory_type: qio_qspi
+    board_build.f_cpu: 240000000L
+    board_build.f_flash: 80000000L
+    board_build.flash_mode: qio
+    build_flags:
+      - -Icustom_components/axp2101  
+      
+  on_boot:
+    - priority: 800
+      then:
+        - lambda: |-
+            uint8_t data1[] = {0x90, 0xBF}; 
+            id(bus_a).write(0x34, data1, 2);
+            uint8_t data2[] = {0x92, 0x1C}; 
+            id(bus_a).write(0x34, data2, 2);
+            uint8_t data3[] = {0x94, 0x1C}; 
+            id(bus_a).write(0x34, data3, 2);
+            pinMode(21, OUTPUT);
+            digitalWrite(21, LOW);
+
+    - priority: -100
+      then:
+        - text_sensor.template.publish:
+            id: last_ean
+            state: "Verbindung..."
+    - priority: -10
+      then:
+      # Befehl zum Deaktivieren des Breathing Mode / Farbwechsels
+      # (Basierend auf Standard-Grow-Protokoll)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0xD9, 0xD3, 0x20] 
+        - delay: 100ms
+      # Optional: Sicherstellen, dass LED bei Erfolg grün leuchtet (Zone Bit 0x0000, Bit 7)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x80, 0xAB, 0xCD]
+        
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: arduino
+    version: recommended
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+  use_address: 192.168.178.120
+  fast_connect: true
+  power_save_mode: NONE
+
+psram:
+  mode: octal
+  speed: 80MHz
+  
+ota:
+  - platform: esphome
+
+safe_mode:
+
+external_components:
+  - source: 
+      type: local
+      path: custom_components
+      
+api:
+  reboot_timeout: 0s
+  on_client_connected:
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(api_ready);'
+          then:
+            - delay: 5s 
+            - lambda: 'id(api_ready) = true;'
+            - rtttl.play: "kasse:d=16,o=7,b=200:e"
+            - text_sensor.template.publish:
+                id: last_ean
+                state: "Bereit zum Scannen"
+
+  services:
+    # DIESER SERVICE HAT GEFEHLT:
+    - service: set_last_product
+      variables:
+        value: string
+      then:
+        - text_sensor.template.publish:
+            id: last_product
+            state: !lambda 'return value;'
+
+    - service: set_last_brand
+      variables:
+        value: string
+      then:
+        - text_sensor.template.publish:
+            id: last_brand
+            state: !lambda 'return value;'
+
+    - service: set_last_kcal
+      variables:
+        value: string
+      then:
+        - text_sensor.template.publish:
+            id: last_kcal
+            state: !lambda 'return value;'
+
+    - service: play_local_beep
+      then:
+        - rtttl.play: "success:d=32,o=6,b=200:c,e"
+logger:
+#  level: INFO
+#  baud_rate: 0
+    
+# --- Hardware Setup ---
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: buzzer_out
+  - platform: ledc
+    pin: ${display_led_pin}
+    id: backlight_pwm
+    
+rtttl:
+  output: buzzer_out
+  id: my_rtttl
+
+i2c:
+  sda: GPIO08
+  scl: GPIO07
+  scan: true
+  id: bus_a
+  
+pca9554:
+  - id: p_c_a
+    address: 0x20
+    
+spi:
+  id: display_spi
+  clk_pin: GPIO05
+  mosi_pin: GPIO01
+  miso_pin: GPIO02
+
+uart:
+  - id: uart_bus
+    baud_rate: 9600
+    tx_pin: ${uart_tx_pin}
+    rx_pin: ${uart_rx_pin}
+    debug:
+      direction: RX
+      dummy_receiver: true
+      after:
+        timeout: 100ms 
+      sequence:
+        - lambda: |-
+            if (!bytes.empty()) {
+              uint32_t now = millis();
+              
+              // --- DOPPELSCAN SCHUTZ (3000ms = 3 Sekunden) ---
+              if (now - id(last_scan_time) < 3000) {
+                ESP_LOGD("scanner", "Doppelscan ignoriert.");
+                return; 
+              }
+              
+              // 1. Display aufwecken / Timer neu starten
+              id(display_timer).execute();
+
+              // Zeit merken
+              id(last_scan_time) = now;
+
+              // 2. Beep sofort abspielen
+              id(my_rtttl).play("kasse:d=16,o=7,b=200:e");
+              
+              // 3. String-Verarbeitung
+              std::string s = "";
+              for (size_t i = 0; i < bytes.size(); i++) {
+                uint8_t b = bytes[i];
+                if (b >= 32 && b <= 126) { s += (char)b; }
+              }
+
+              if (!s.empty()) {
+                id(last_ean).publish_state(s);
+                ESP_LOGD("scanner", "Daten empfangen: %s", s.c_str());
+              }
+            }
+# --- Sensoren & Logik ---
+globals:
+  - id: api_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_scan_time
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'  
+font:
+  - file: "_fonts/arial.ttf"
+    id: arial_font_18
+    size: 35
+    glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
+    
+  - file: "_fonts/arial.ttf"
+    id: arial_font
+    size: 30
+    glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
+
+  - file: "_fonts/arial.ttf"
+    id: arial_font_bold
+    size: 40 
+    glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
+    
+text_sensor:
+  - platform: template
+    id: last_ean
+    name: "ean"
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(api_ready) && 
+                       x != "Bereit zum Scannen" && 
+                       x != "Verbindung..." && 
+                       !x.empty();
+            then:
+              - delay: 15s
+              - text_sensor.template.publish: { id: last_ean, state: "Bereit zum Scannen" }
+              
+  - platform: template
+    id: last_product
+    name: "last_product"
+
+  - platform: template
+    id: last_brand
+    name: "last_brand"
+
+  - platform: template
+    id: last_kcal
+    name: "last_kcal"
+
+  - platform: axp2101
+    charge_status:
+      name: "Ladestatus"
+      id: batt_status
+      icon: "mdi:power-plug" # Standard-Icon
+      # Ein Lambda in ESPHome kann das Icon sogar live ändern:
+      on_value:
+        then:
+          - lambda: |-
+              if (x == "Lädt...") {
+                id(batt_status).set_icon("mdi:battery-charging");
+              } else if (x == "Akkubetrieb") {
+                id(batt_status).set_icon("mdi:battery-remove");
+              } else {
+                id(batt_status).set_icon("mdi:battery-check");
+              }
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: Display Backlight
+    id: display_backlight
+    restore_mode: ALWAYS_ON
+    gamma_correct: 1    
+#light:
+#  - platform: monochromatic
+#    output: backlight_pwm
+#    id: disp_backlight
+#    restore_mode: ALWAYS_ON
+
+#interval:
+#  - interval: 5s
+#    then:
+#      - lambda: |-
+#          if(id(api_ready)) {
+#            id(api_ready) = true;
+#            id(last_ean).publish_state("Bereit zum Scannen");
+#          }
+
+display:
+  - platform: mipi_spi
+    id: my_display
+    model: st7796
+    spi_id: display_spi
+    cs_pin: {pca9554: p_c_a, number: 2}
+    dc_pin: 3
+    reset_pin: {pca9554: p_c_a, number: 1}
+    rotation: 90
+    update_interval: 0.5s
+    invert_colors: true 
+    lambda: |-
+      it.fill(Color(0,0,0));
+      int x_center = it.get_width() / 2;
+      int screen_width = it.get_width();
+      
+      // --- HEADER ---
+      it.filled_rectangle(0, 0, screen_width, 45, Color(40, 40, 40)); 
+      it.print(x_center - 40, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_CENTER, "BARCODE SCANNER");
+
+      // AKKU ANZEIGE OBEN RECHTS (Prüfung ob Wert vorhanden)
+      if (id(batt_pct).has_state()) {
+        it.printf(screen_width - 10, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_RIGHT, "%.0f%%", id(batt_pct).state);
+      }
+      it.line(0, 45, screen_width, 45, Color(255, 255, 255));
+      
+      if (!id(api_ready)) {
+        // STARTUP MODUS
+        it.print(x_center, 120, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, "System startet...");
+        it.print(x_center, 170, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, " ...Bitte warten...");
+      } else {
+        std::string ean_status = id(last_ean).state;
+        
+        if (ean_status == "Bereit zum Scannen" || ean_status.empty()) {
+          it.print(x_center, 150, id(arial_font), Color(0,255,0), TextAlign::CENTER, "Bereit zum Scannen");
+        } else {
+          // --- SCAN MODUS ---
+          
+          // 1. EAN Nummer (Y=60)
+          it.printf(x_center, 60, id(arial_font_18), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
+          
+          // 2. Marke (Y=130) - Gelb
+          if (!id(last_brand).state.empty()) {
+            it.print(x_center, 130, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, id(last_brand).state.c_str());
+          }
+          
+          // 3. Bezeichnung (Y=190) - Weiß
+          if (!id(last_product).state.empty()) {
+            it.print(x_center, 190, id(arial_font), Color(255,255,255), TextAlign::CENTER, id(last_product).state.c_str());
+          }
+          
+          // 4. Restmenge (Y=260) - Cyan & Fix für die .0
+          if (!id(last_kcal).state.empty() && id(last_kcal).state != "unknown") {
+            std::string s = id(last_kcal).state;
+            size_t dot = s.find(".0");
+            if (dot != std::string::npos) { s.erase(dot, 2); } 
+            it.print(x_center, 260, id(arial_font), Color(0,255,255), TextAlign::CENTER, s.c_str());
+          } else {
+            it.print(x_center, 260, id(arial_font), Color(60,60,60), TextAlign::CENTER, "Suche Daten...");
+          }
+        }
+      }
+
+touchscreen:
+  platform: ft63x6
+  transform:
+    swap_xy: true
+    mirror_x: false
+    mirror_y: true
+  on_touch:
+    - lambda: |-
+        // Korrigierte Abfrage für den Licht-Status in C++
+        if (id(display_backlight).remote_values.is_on()) {
+          // Display ist schon an -> Timer verlängern und Log schreiben
+          id(display_timer).execute();
+          ESP_LOGI("cal", "x=%d, y=%d, x_raw=%d, y_raw=%0d",
+              touch.x,
+              touch.y,
+              touch.x_raw,
+              touch.y_raw
+          );
+        } else {
+          // Display ist aus -> Nur aufwecken (Klick wird verschluckt)
+          id(display_timer).execute();
+          ESP_LOGI("touch", "Display aufgeweckt");
+        }
+  
+binary_sensor:
+  - platform: status
+    name: "System Status"
+    id: system_status
+
+  - platform: template
+    name: "Scanner am Strom"
+    device_class: plug
+    lambda: |-
+      return (id(batt_status).state != "Akkubetrieb");    
+
+axp2101:
+  update_interval: 30s
+
+sensor:
+  - platform: axp2101
+    battery_level:
+      name: "Batterie Prozent"
+      id: batt_pct
+      accuracy_decimals: 0
+      icon: "mdi:battery"
+      # Hier biegen wir die falsche Chip-Berechnung gerade:
+      filters:
+        - calibrate_linear:
+            # Chip-Spannung -> Reale Prozente
+            - 3.30 -> 0
+            - 3.50 -> 10
+            - 3.75 -> 50
+            - 4.00 -> 85
+            - 4.18 -> 100
+        - clamp: # Verhindert Werte außerhalb von 0-100%
+            min_value: 0
+            max_value: 100
+            
+    battery_voltage:
+      name: "Batterie Spannung"
+      id: batt_voltage
+      accuracy_decimals: 2
+      unit_of_measurement: "V"
+      device_class: voltage
+      
+script:
+  - id: display_timer
+    mode: restart
+    then:
+      - light.turn_on: display_backlight
+      - delay: 30s
+      - light.turn_off: display_backlight  
+      
+button:
+  - platform: template
+    name: "1.Scanner Komplett Reset"
+    on_press:
+      then:
+        - logger.log: "Sende harten Reset-Befehl..."
+        # Exakter Befehl aus Handbuch S.7 (Reset to Defaults)
+        # 7E 00 09 01 00 00 00 DE C8
+        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8]
+        - delay: 2s
+        - logger.log: "Reset abgeschlossen. Er sollte jetzt piepen."
+  - platform: template
+    name: "2.Scanner Auto-Scan Aktivieren"
+    on_press:
+      then:
+        # Setzt Lese-Modus auf Induction (Handbuch S.23)
+        # Register 0000 auf Wert 03 (Induction Mode)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x03, 0xAB, 0xCD]
+        - delay: 500ms
+        # Speichern im Flash (Handbuch S.6)
+        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8] 
+  
