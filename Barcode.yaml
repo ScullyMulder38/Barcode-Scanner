@@ -43,7 +43,15 @@ esphome:
         - delay: 100ms
       # Optional: Sicherstellen, dass LED bei Erfolg grün leuchtet (Zone Bit 0x0000, Bit 7)
         - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x80, 0xAB, 0xCD]
-        
+    - priority: -100
+      then:
+        - text_sensor.template.publish:
+            id: last_ean
+            state: "Bereit zum Scannen"
+        # Starte den Timer sofort nach dem Booten:
+        - script.execute: display_timer
+        - logger.log: "Initialer Display-Timeout gestartet."
+            
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
