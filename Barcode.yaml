@@ -1,8 +1,8 @@
 substitutions:
   name: "barcode-scanner"
   friendly_name: "Barcode Scanner"
-  uart_tx_pin: GPIO41
-  uart_rx_pin: GPIO42
+  uart_tx_pin: GPIO43
+  uart_rx_pin: GPIO44
   display_led_pin: GPIO06
 
 
@@ -16,42 +16,26 @@ esphome:
     board_build.flash_mode: qio
     build_flags:
       - -Icustom_components/axp2101  
-      
-  on_boot:
-    - priority: 800
-      then:
-        - lambda: |-
-            uint8_t data1[] = {0x90, 0xBF}; 
-            id(bus_a).write(0x34, data1, 2);
-            uint8_t data2[] = {0x92, 0x1C}; 
-            id(bus_a).write(0x34, data2, 2);
-            uint8_t data3[] = {0x94, 0x1C}; 
-            id(bus_a).write(0x34, data3, 2);
-            pinMode(21, OUTPUT);
-            digitalWrite(21, LOW);
 
+  on_boot:
     - priority: -100
       then:
-        - text_sensor.template.publish:
-            id: last_ean
-            state: "Verbindung..."
-    - priority: -10
-      then:
-      # Befehl zum Deaktivieren des Breathing Mode / Farbwechsels
-      # (Basierend auf Standard-Grow-Protokoll)
-        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0xD9, 0xD3, 0x20] 
-        - delay: 100ms
-      # Optional: Sicherstellen, dass LED bei Erfolg grün leuchtet (Zone Bit 0x0000, Bit 7)
-        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x80, 0xAB, 0xCD]
-    - priority: -100
-      then:
-        - text_sensor.template.publish:
-            id: last_ean
-            state: "Bereit zum Scannen"
-        # Starte den Timer sofort nach dem Booten:
-        - script.execute: display_timer
-        - logger.log: "Initialer Display-Timeout gestartet."
-            
+        - delay: 5s
+        - logger.log: "Konfiguriere Scanner: GM60..."
+
+        # 1. Modus: Induction + Licht Immer An (Register 0x0000 -> 0x0F)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x0F, 0xAB, 0xCD]
+        - delay: 200ms
+
+        # 2. Farbe: Blau Dauer + Grün Erfolg (Register 0x001B -> 0x9A)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x1B, 0x9A, 0xAB, 0xCD]
+        - delay: 200ms
+
+        # 3. Sound: Scan-Ton AN + Start-Ton AN (Register 0x000E -> 0x04)
+        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x0E, 0x04, 0xAB, 0xCD]
+        
+        - logger.log: "Setup Scanner GM60 abgeschlossen!"
+        
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
@@ -133,7 +117,7 @@ logger:
 # --- Hardware Setup ---
 output:
   - platform: ledc
-    pin: GPIO21
+    pin: GPIO38 # alt 21
     id: buzzer_out
   - platform: ledc
     pin: ${display_led_pin}
@@ -429,27 +413,28 @@ script:
     then:
       - light.turn_on: display_backlight
       - delay: 30s
-      - light.turn_off: display_backlight  
-      
-button:
-  - platform: template
-    name: "1.Scanner Komplett Reset"
-    on_press:
-      then:
-        - logger.log: "Sende harten Reset-Befehl..."
-        # Exakter Befehl aus Handbuch S.7 (Reset to Defaults)
-        # 7E 00 09 01 00 00 00 DE C8
-        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8]
-        - delay: 2s
-        - logger.log: "Reset abgeschlossen. Er sollte jetzt piepen."
-  - platform: template
-    name: "2.Scanner Auto-Scan Aktivieren"
-    on_press:
-      then:
-        # Setzt Lese-Modus auf Induction (Handbuch S.23)
-        # Register 0000 auf Wert 03 (Induction Mode)
-        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x03, 0xAB, 0xCD]
-        - delay: 500ms
-        # Speichern im Flash (Handbuch S.6)
-        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8] 
+      - light.turn_off: display_backlight 
+       
+#wird nicht mehr benötigt, wir im on_boot erledigt      
+#button:
+#  - platform: template
+#    name: "1.Scanner Komplett Reset"
+#    on_press:
+#      then:
+#        - logger.log: "Sende harten Reset-Befehl..."
+#        # Exakter Befehl aus Handbuch S.7 (Reset to Defaults)
+#        # 7E 00 09 01 00 00 00 DE C8
+#        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8]
+#        - delay: 2s
+#        - logger.log: "Reset abgeschlossen. Er sollte jetzt piepen."
+#  - platform: template
+#    name: "2.Scanner Auto-Scan Aktivieren"
+#    on_press:
+#      then:
+#        # Setzt Lese-Modus auf Induction (Handbuch S.23)
+#        # Register 0000 auf Wert 03 (Induction Mode)
+#        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x03, 0xAB, 0xCD]
+#        - delay: 500ms
+#        # Speichern im Flash (Handbuch S.6)
+#        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8] 
   
