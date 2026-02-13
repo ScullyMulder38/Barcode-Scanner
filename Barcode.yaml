@@ -35,7 +35,37 @@ esphome:
         - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x0E, 0x04, 0xAB, 0xCD]
         
         - logger.log: "Setup Scanner GM60 abgeschlossen!"
-        
+
+    - priority: -50
+      then:
+        - lambda: |-
+            // Register 0x62 auf 1000mA setzen (Wert 16 bzw. 0x10)
+            uint8_t cmd[2] = {0x62, 16}; 
+            if (id(bus_a).write(0x34, cmd, 2, true) == esphome::i2c::ERROR_OK) {
+              ESP_LOGI("AXP2101", "Ladestrom erfolgreich auf 1000mA gesetzt!");
+            } else {
+              ESP_LOGE("AXP2101", "Fehler beim Setzen des Ladestroms!");
+            }
+
+    - priority: -90
+      then:
+        - lambda: |-
+            // 1. PMU Power wie gehabt
+            uint8_t pwr_en[2] = {0x90, 0xFF};
+            id(bus_a).write(0x34, pwr_en, 2);
+
+            // 2. ADC AKTIVIEREN (Das fehlende Puzzleteil!)
+            // Wir schalten alle ADC-Kanäle ein (Register 0x30 auf 0xFF)
+            uint8_t adc_en[2] = {0x30, 0xFF};
+            id(bus_a).write(0x34, adc_en, 2);
+          
+            // 3. ADC Frequenz/Modus (Register 0x31)
+            // Wir setzen 25Hz Messrate für flüssige Werte
+            uint8_t adc_rate[2] = {0x31, 0x01};
+            id(bus_a).write(0x34, adc_rate, 2);
+
+            ESP_LOGI("AXP", "ADC und Sensoren aktiviert!");
+                    
 esp32:
   board: esp32-s3-devkitc-1
   variant: esp32s3
@@ -138,10 +168,10 @@ pca9554:
     address: 0x20
     
 spi:
-  id: display_spi
-  clk_pin: GPIO05
-  mosi_pin: GPIO01
-  miso_pin: GPIO02
+  - id: display_spi
+    clk_pin: GPIO05
+    mosi_pin: GPIO01
+    miso_pin: GPIO02
 
 uart:
   - id: uart_bus
@@ -210,6 +240,11 @@ font:
     id: arial_font_bold
     size: 40 
     glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
+
+  - file: "_fonts/arial.ttf"
+    id: arial_font_14
+    size: 16
+    glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
     
 text_sensor:
   - platform: template
@@ -240,22 +275,141 @@ text_sensor:
     id: last_kcal
     name: "last_kcal"
 
+  # Der PMU Status als Klartext (Reg 01)
+  - platform: template
+    name: "PMU Status"
+    id: pmu_status_text
+    update_interval: 30s
+    lambda: |-
+      uint8_t reg = 0x01;
+      uint8_t val = 0;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, &val, 1) == esphome::i2c::ERROR_OK) {
+          uint8_t dir = (val >> 5) & 0x03; // Bits 6:5
+          uint8_t charge = val & 0x07;    // Bits 2:0
+          
+          if (dir == 0b01) return {"Laden"};
+          if (dir == 0b10) return {"Entladen"};
+          if (charge == 0b100) return {"Voll geladen"};
+          return {"Standby"};
+        }
+      }
+      return {"Keine Daten"};
+
+  - platform: template
+    name: "Ladestatus Detail"
+    icon: "mdi:battery-check"
+    lambda: |-
+      uint8_t val = 0;
+      if (id(bus_a).read(0x34, &val, 1) == esphome::i2c::ERROR_OK) {
+        uint8_t dir = (val >> 5) & 0x03;    // Bit 6:5: Richtung
+        uint8_t status = val & 0x07;       // Bit 2:0: Phase
+        
+        if (dir == 0b01) { // Lade-Modus
+          if (status == 0b010) return {"Laden (Schnell/CC)"};
+          if (status == 0b011) return {"Laden (Konst. Spannung/CV)"};
+          return {"Wird geladen"};
+        } else if (dir == 0b10) {
+          return {"Akku-Betrieb (Entladen)"};
+        }
+        return {"Standby / Voll"};
+      }
+      return {"Fehler"};
+
+sensor:
+  # 1. Die Standard-Sensoren vom AXP2101
   - platform: axp2101
-    charge_status:
-      name: "Ladestatus"
-      id: batt_status
-      icon: "mdi:power-plug" # Standard-Icon
-      # Ein Lambda in ESPHome kann das Icon sogar live ändern:
-      on_value:
-        then:
-          - lambda: |-
-              if (x == "Lädt...") {
-                id(batt_status).set_icon("mdi:battery-charging");
-              } else if (x == "Akkubetrieb") {
-                id(batt_status).set_icon("mdi:battery-remove");
-              } else {
-                id(batt_status).set_icon("mdi:battery-check");
-              }
+    battery_level:
+      name: "Batterie Prozent"
+      id: batterie_ladestand  # <--- ID für das Display-Lambda
+    battery_voltage:
+      name: "Batterie Spannung"
+      id: batt_voltage
+
+  # 2. Dein manuelles Ladelimit
+  - platform: template
+    name: "Ladelimit konfiguriert"
+    id: reg_62_val
+    unit_of_measurement: "mA"
+    update_interval: 60s 
+    lambda: |-
+      uint8_t reg = 0x62;
+      uint8_t n = 0;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, &n, 1) == esphome::i2c::ERROR_OK) {
+          n &= 0x1F;
+          return (n <= 8) ? (float)(25 * n) : (float)(200 + 100 * (n - 8));
+        }
+      }
+      return NAN;
+
+  - platform: template
+    name: "Akku Warnschwelle"
+    id: akku_warnschwelle  # <--- Das hat gefehlt!
+    unit_of_measurement: "%"
+    icon: "mdi:bell-ring"
+    lambda: |-
+      uint8_t reg = 0x1A;
+      uint8_t val = 0;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, &val, 1) == esphome::i2c::ERROR_OK) {
+          uint8_t level2 = (val >> 4) & 0x0F;
+          return (float)(5 + level2); 
+        }
+      }
+      return NAN;
+
+  - platform: template
+    name: "Chip Temperatur"
+    id: chip_temp # Falls du sie auch im Display willst
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    lambda: |-
+      uint8_t buffer[2];
+      uint8_t reg = 0x3C;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, buffer, 2) == esphome::i2c::ERROR_OK) {
+          int16_t res = ((buffer[0] & 0x3F) << 8) | buffer[1];
+          if (res == 0) return NAN;
+          return (float)res * 0.1 - 677.3;
+        }
+      }
+      return NAN;
+
+# Nicht vergessen: Den Ladesensor für das "+" im Display brauchen wir auch noch
+binary_sensor:
+  - platform: template
+    name: "Batterie Laden"
+    id: batterie_laden
+    lambda: |-
+      uint8_t reg = 0x01;
+      uint8_t status;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, &status, 1) == esphome::i2c::ERROR_OK) {
+          return (status & 0x20); // Bit 5: VBUS charging
+        }
+      }
+      return {};
+      
+  - platform: status
+    name: "System Status"
+    id: system_status
+
+  - platform: template
+    name: "Akku Kritisch Alarm"
+    device_class: battery_charging
+    id: batt_crit_alarm
+    lambda: |-
+      uint8_t reg = 0x00;
+      uint8_t val = 0;
+      if (id(bus_a).write(0x34, &reg, 1, true) == esphome::i2c::ERROR_OK) {
+        if (id(bus_a).read(0x34, &val, 1) == esphome::i2c::ERROR_OK) {
+          // Bit 0 zeigt "Low Battery Warning" an
+          return (val & 0x01); 
+        }
+      }
+      return false;
+  
 
 light:
   - platform: monochromatic
@@ -264,20 +418,6 @@ light:
     id: display_backlight
     restore_mode: ALWAYS_ON
     gamma_correct: 1    
-#light:
-#  - platform: monochromatic
-#    output: backlight_pwm
-#    id: disp_backlight
-#    restore_mode: ALWAYS_ON
-
-#interval:
-#  - interval: 5s
-#    then:
-#      - lambda: |-
-#          if(id(api_ready)) {
-#            id(api_ready) = true;
-#            id(last_ean).publish_state("Bereit zum Scannen");
-#          }
 
 display:
   - platform: mipi_spi
@@ -285,7 +425,9 @@ display:
     model: st7796
     spi_id: display_spi
     cs_pin: {pca9554: p_c_a, number: 2}
-    dc_pin: 3
+    dc_pin: 
+      number: 3
+      ignore_strapping_warning: true # Behebt die Fehlermeldung
     reset_pin: {pca9554: p_c_a, number: 1}
     rotation: 90
     update_interval: 0.5s
@@ -295,53 +437,81 @@ display:
       int x_center = it.get_width() / 2;
       int screen_width = it.get_width();
       
-      // --- HEADER ---
+      // --- HEADER (45px hoch) ---
       it.filled_rectangle(0, 0, screen_width, 45, Color(40, 40, 40)); 
-      it.print(x_center - 40, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_CENTER, "BARCODE SCANNER");
+      it.print(10, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_LEFT, "BARCODE SCANNER");
 
-      // AKKU ANZEIGE OBEN RECHTS (Prüfung ob Wert vorhanden)
-      if (id(batt_pct).has_state()) {
-        it.printf(screen_width - 10, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_RIGHT, "%.0f%%", id(batt_pct).state);
+      // --- BATTERIE & PROZENT ---
+      if (id(batterie_ladestand).has_state()) {
+        float level = id(batterie_ladestand).state;
+        float threshold = id(akku_warnschwelle).has_state() ? id(akku_warnschwelle).state : 15.0; 
+        Color batt_color = Color(0, 255, 0);
+        
+        if (level < threshold) batt_color = Color(255, 0, 0);
+        else if (level < 50.0) batt_color = Color(255, 165, 0);
+
+        bool blink_off = (level < threshold) && !id(batterie_laden).state && ((millis() / 500) % 2 == 0);
+
+        if (!blink_off) {
+          int perc_x = screen_width - 5; 
+          // batt_x von -100 auf -110 (weiter nach links)
+          int batt_x = screen_width - 105; 
+          // y_pos von 17 auf 19 (etwas nach unten)
+          int y_pos = 19; 
+
+          // 1. Prozentzahl
+          it.printf(perc_x, 10, id(arial_font), batt_color, TextAlign::TOP_RIGHT, "%.0f%%", level);
+
+          // 2. Akku Symbol (leicht verkleinert für bessere Optik)
+          int b_width = 28;
+          int b_height = 14;
+          it.rectangle(batt_x, y_pos, b_width, b_height, batt_color);
+          it.filled_rectangle(batt_x + b_width, y_pos + 4, 2, 6, batt_color);
+          
+          int fill_w = (int)((level / 100.0) * (b_width - 4));
+          if (fill_w > 0) {
+            it.filled_rectangle(batt_x + 2, y_pos + 2, fill_w, b_height - 4, batt_color);
+          }
+          
+          // Lade-Plus über dem Akku
+          if (id(batterie_laden).state) {
+            it.print(batt_x + (b_width/2), y_pos - 6, id(arial_font), Color(255,255,255), TextAlign::CENTER, "+");
+          }
+        }
       }
+
       it.line(0, 45, screen_width, 45, Color(255, 255, 255));
       
+      // --- HAUPTBEREICH (SCANNER BEREIT LOGIK) ---
       if (!id(api_ready)) {
-        // STARTUP MODUS
-        it.print(x_center, 120, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, "System startet...");
-        it.print(x_center, 170, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, " ...Bitte warten...");
+        it.print(x_center, 150, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, "System startet...");
       } else {
         std::string ean_status = id(last_ean).state;
         
-        if (ean_status == "Bereit zum Scannen" || ean_status.empty()) {
-          it.print(x_center, 150, id(arial_font), Color(0,255,0), TextAlign::CENTER, "Bereit zum Scannen");
+        if (ean_status == "Bereit zum Scannen" || ean_status.empty() || ean_status == "unknown") {
+          it.print(x_center, 160, id(arial_font_18), Color(0,255,0), TextAlign::CENTER, "SCANNER BEREIT");
+          it.print(x_center, 200, id(arial_font), Color(100,100,100), TextAlign::CENTER, "Warte auf Barcode...");
         } else {
-          // --- SCAN MODUS ---
+          // Scan Modus
+          it.printf(x_center, 70, id(arial_font_18), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
           
-          // 1. EAN Nummer (Y=60)
-          it.printf(x_center, 60, id(arial_font_18), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
-          
-          // 2. Marke (Y=130) - Gelb
           if (!id(last_brand).state.empty()) {
             it.print(x_center, 130, id(arial_font_18), Color(255,255,0), TextAlign::CENTER, id(last_brand).state.c_str());
           }
           
-          // 3. Bezeichnung (Y=190) - Weiß
           if (!id(last_product).state.empty()) {
             it.print(x_center, 190, id(arial_font), Color(255,255,255), TextAlign::CENTER, id(last_product).state.c_str());
           }
           
-          // 4. Restmenge (Y=260) - Cyan & Fix für die .0
           if (!id(last_kcal).state.empty() && id(last_kcal).state != "unknown") {
             std::string s = id(last_kcal).state;
             size_t dot = s.find(".0");
             if (dot != std::string::npos) { s.erase(dot, 2); } 
             it.print(x_center, 260, id(arial_font), Color(0,255,255), TextAlign::CENTER, s.c_str());
-          } else {
-            it.print(x_center, 260, id(arial_font), Color(60,60,60), TextAlign::CENTER, "Suche Daten...");
           }
         }
       }
-
+      
 touchscreen:
   platform: ft63x6
   transform:
@@ -366,75 +536,32 @@ touchscreen:
           ESP_LOGI("touch", "Display aufgeweckt");
         }
   
-binary_sensor:
-  - platform: status
-    name: "System Status"
-    id: system_status
 
-  - platform: template
-    name: "Scanner am Strom"
-    device_class: plug
-    lambda: |-
-      return (id(batt_status).state != "Akkubetrieb");    
-
+  
 axp2101:
+  id: axp_chip
   update_interval: 30s
-
-sensor:
-  - platform: axp2101
-    battery_level:
-      name: "Batterie Prozent"
-      id: batt_pct
-      accuracy_decimals: 0
-      icon: "mdi:battery"
-      # Hier biegen wir die falsche Chip-Berechnung gerade:
-      filters:
-        - calibrate_linear:
-            # Chip-Spannung -> Reale Prozente
-            - 3.30 -> 0
-            - 3.50 -> 10
-            - 3.75 -> 50
-            - 4.00 -> 85
-            - 4.18 -> 100
-        - clamp: # Verhindert Werte außerhalb von 0-100%
-            min_value: 0
-            max_value: 100
-            
-    battery_voltage:
-      name: "Batterie Spannung"
-      id: batt_voltage
-      accuracy_decimals: 2
-      unit_of_measurement: "V"
-      device_class: voltage
       
 script:
   - id: display_timer
     mode: restart
     then:
       - light.turn_on: display_backlight
-      - delay: 30s
+      - delay: 60s
       - light.turn_off: display_backlight 
-       
-#wird nicht mehr benötigt, wir im on_boot erledigt      
-#button:
-#  - platform: template
-#    name: "1.Scanner Komplett Reset"
-#    on_press:
-#      then:
-#        - logger.log: "Sende harten Reset-Befehl..."
-#        # Exakter Befehl aus Handbuch S.7 (Reset to Defaults)
-#        # 7E 00 09 01 00 00 00 DE C8
-#        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8]
-#        - delay: 2s
-#        - logger.log: "Reset abgeschlossen. Er sollte jetzt piepen."
-#  - platform: template
-#    name: "2.Scanner Auto-Scan Aktivieren"
-#    on_press:
-#      then:
-#        # Setzt Lese-Modus auf Induction (Handbuch S.23)
-#        # Register 0000 auf Wert 03 (Induction Mode)
-#        - uart.write: [0x7E, 0x00, 0x08, 0x01, 0x00, 0x00, 0x03, 0xAB, 0xCD]
-#        - delay: 500ms
-#        # Speichern im Flash (Handbuch S.6)
-#        - uart.write: [0x7E, 0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0xDE, 0xC8] 
-  
+      
+# 1. I2S Hardware-Definition (Keine externen Libs nötig!)
+i2s_audio:
+  - id: i2s_bus
+    i2s_mclk_pin: GPIO12
+    i2s_bclk_pin: GPIO13
+    i2s_lrclk_pin: GPIO15
+
+# 2. Der Media Player für Home Assistant
+media_player:
+  - platform: i2s_audio
+    name: "Scanner Lautsprecher"
+    id: scanner_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO14
+    mode: mono
