@@ -225,22 +225,15 @@ uart:
             if (!bytes.empty()) {
               uint32_t now = millis();
               
-              // --- DOPPELSCAN SCHUTZ (3000ms = 3 Sekunden) ---
               if (now - id(last_scan_time) < 3000) {
                 ESP_LOGD("scanner", "Doppelscan ignoriert.");
                 return; 
               }
               
-              // 1. Display aufwecken / Timer neu starten
               id(display_timer).execute();
-
-              // Zeit merken
               id(last_scan_time) = now;
-
-              // 2. Beep sofort abspielen
               id(my_rtttl).play("kasse:d=16,o=7,b=200:e");
               
-              // 3. String-Verarbeitung
               std::string s = "";
               for (size_t i = 0; i < bytes.size(); i++) {
                 uint8_t b = bytes[i];
@@ -248,16 +241,15 @@ uart:
               }
 
               if (!s.empty()) {
-                // --- NEU: ZWISCHENSTATUS SETZEN ---
-                // Setzt den Text-Sensor sofort auf diesen Wert, 
-                // damit das Display "Scannen erfolgreich" anzeigt.
-                id(last_product).publish_state("Suche läuft..."); 
+                // --- GEÄNDERT: Exakter Text für das Display ---
+                id(last_product).publish_state("EAN erkannt - suche Daten"); 
 
                 // EAN an Home Assistant senden
                 id(last_ean).publish_state(s);
                 ESP_LOGD("scanner", "Daten empfangen: %s", s.c_str());
               }
             }
+            
 # --- Sensoren & Logik ---
 globals:
   - id: api_ready
@@ -521,7 +513,7 @@ display:
       ignore_strapping_warning: true
     reset_pin: {pca9554: p_c_a, number: 1}
     rotation: 90
-    update_interval: 2s  # Intervall verkürzt für schnellere Reaktion
+    update_interval: 2s 
     invert_colors: true 
     lambda: |-
       it.fill(Color(0,0,0));
@@ -586,38 +578,45 @@ display:
         std::string ean_status = id(last_ean).state;
         std::string prod_status = id(last_product).state;
         
+        // 1. ZUSTAND: STANDBY
         if (ean_status == "Bereit zum Scannen" || ean_status.empty() || ean_status == "unknown") {
           it.print(x_center, 150, id(arial_font_18), Color(0,255,0), TextAlign::CENTER, "SCANNER BEREIT");
           it.print(x_center, 190, id(arial_font), Color(150,150,150), TextAlign::CENTER, "Warte auf Barcode...");
         } 
-        // NEU: Zwischenmeldung nach dem Scan
-        else if (prod_status == "Suche läuft...") {
-          it.print(x_center, 140, id(arial_font_18), Color(0,255,255), TextAlign::CENTER, "Scannen erfolgreich");
-          it.print(x_center, 180, id(arial_font), Color(255,255,255), TextAlign::CENTER, "Warte auf Daten...");
+        
+        // 2. ZUSTAND: SCAN ERFOLGT, SUCHE LÄUFT
+        else if (prod_status == "EAN erkannt - suche Daten") {
+          it.print(x_center, 140, id(arial_font_18), Color(0,255,255), TextAlign::CENTER, "EAN erkannt");
+          it.print(x_center, 180, id(arial_font), Color(255,255,255), TextAlign::CENTER, "suche Daten...");
         }
+        
+        // 3. ZUSTAND: PRODUKT GEFUNDEN (ODER FEHLERMELDUNG VON HA)
         else {
-          // 1. EAN
-          it.printf(x_center, 55, id(arial_font_14), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
+          // Grüner Rahmen um den Datenbereich
+          it.rectangle(5, 50, screen_width - 10, 260, Color(0, 255, 0));
           
-          // 2. MARKE (Gelb)
-          it.print(x_center, 80, id(arial_font_18), Color(255,255,0), TextAlign::TOP_CENTER, id(last_brand).state.c_str());
+          // EAN (Grau)
+          it.printf(x_center, 60, id(arial_font_14), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
           
-          // 3. PRODUKTNAME (Weiß, Groß & Fett)
-          it.print(x_center, 130, id(arial_font_bold), Color(255,255,255), TextAlign::TOP_CENTER, id(last_product).state.c_str());
+          // Marke (Gelb)
+          it.print(x_center, 85, id(arial_font_18), Color(255,255,0), TextAlign::TOP_CENTER, id(last_brand).state.c_str());
           
-          // 4. GEWICHT (Tiefer gesetzt)
+          // Produktname (Weiß, Groß & Fett)
+          it.print(x_center, 125, id(arial_font_bold), Color(255,255,255), TextAlign::TOP_CENTER, id(last_product).state.c_str());
+          
+          // Gewicht
           if (!id(last_weight).state.empty() && id(last_weight).state != "unknown") {
             it.print(x_center, 180, id(arial_font), Color(200,200,200), TextAlign::TOP_CENTER, id(last_weight).state.c_str());
           }
 
-          // 5. RESTBESTAND (Grün)
+          // Restbestand (Grün)
           if (!id(last_stock).state.empty() && id(last_stock).state != "unknown") {
-             it.printf(x_center, 230, id(arial_font_18), Color(0,255,0), TextAlign::TOP_CENTER, "Restbestand: %s", id(last_stock).state.c_str());
+             it.printf(x_center, 225, id(arial_font_18), Color(0,255,0), TextAlign::TOP_CENTER, "Restbestand: %s", id(last_stock).state.c_str());
           }
           
-          // 6. MINDESTBESTAND (Cyan)
+          // Mindestbestand (Cyan) - Hier wird die kcal ID zweckentfremdet
           if (!id(last_kcal).state.empty() && id(last_kcal).state != "unknown") {
-            it.printf(x_center, 275, id(arial_font_18), Color(0,255,255), TextAlign::TOP_CENTER, "Mindestbestand: %s", id(last_kcal).state.c_str());
+            it.printf(x_center, 270, id(arial_font_18), Color(0,255,255), TextAlign::TOP_CENTER, "Mindestbestand: %s", id(last_kcal).state.c_str());
           }
         }
       }
