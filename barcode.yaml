@@ -29,49 +29,22 @@ esphome:
 
             // 2. Ladestrom auf 400mA (Wert 10)
             uint8_t charge_cmd[2] = {0x62, 10}; 
-            if (id(bus_a).write(0x34, charge_cmd, 2) == esphome::i2c::ERROR_OK) {
-              ESP_LOGI("PMU", "Ladestrom auf 400mA gesetzt");
+            id(bus_a).write(0x34, charge_cmd, 2);
+
+            // 3. Sicherheits-Timer DEAKTIVIEREN
+            uint8_t r67 = 0x67; uint8_t v67 = 0;
+            if (id(bus_a).write(0x34, &r67, 1, true) == esphome::i2c::ERROR_OK && id(bus_a).read(0x34, &v67, 1) == esphome::i2c::ERROR_OK) {
+              uint8_t t_off[2] = {0x67, (uint8_t)(v67 & 0xBF)};
+              id(bus_a).write(0x34, t_off, 2);
             }
 
-            // 3. Sicherheits-Timer DEAKTIVIEREN (Wichtig fuer 10Ah Akku)
-            uint8_t reg67_addr = 0x67;
-            uint8_t val67_tmp = 0;
-            if (id(bus_a).write(0x34, &reg67_addr, 1, true) == esphome::i2c::ERROR_OK) {
-              if (id(bus_a).read(0x34, &val67_tmp, 1) == esphome::i2c::ERROR_OK) {
-                uint8_t timer_off[2] = {0x67, (uint8_t)(val67_tmp & 0xBF)}; // Bit 6 auf 0
-                id(bus_a).write(0x34, timer_off, 2);
-                ESP_LOGW("PMU", "Sicherheits-Timer fuer 10Ah Akku deaktiviert.");
-              }
-            }
+            // 4. Power & ADC
+            id(bus_a).write(0x34, (uint8_t[]){0x90, 0xFF}, 2);
+            id(bus_a).write(0x34, (uint8_t[]){0x30, 0xFF}, 2);
 
-            // 4. Power-Schienen & ADC aktivieren
-            uint8_t pwr_en[2] = {0x90, 0xFF};
-            id(bus_a).write(0x34, pwr_en, 2);
-            
-            uint8_t adc_en[2] = {0x30, 0xFF};
-            id(bus_a).write(0x34, adc_en, 2);
-            
-            ESP_LOGI("PMU", "Initialisierung abgeschlossen.");
-
-            // 5. Register auslesen zur Kontrolle
-            uint8_t r62_addr = 0x62;
-            uint8_t v62 = 0;
-            uint8_t r67_addr2 = 0x67;
-            uint8_t v67 = 0;
-
-            if (id(bus_a).write(0x34, &r62_addr, 1, true) == esphome::i2c::ERROR_OK && 
-                id(bus_a).read(0x34, &v62, 1) == esphome::i2c::ERROR_OK) {
-              ESP_LOGI("PMU_READ", "REG 62: 0x%02X (Soll 0x0A)", v62);
-            }
-
-            if (id(bus_a).write(0x34, &r67_addr2, 1, true) == esphome::i2c::ERROR_OK && 
-                id(bus_a).read(0x34, &v67, 1) == esphome::i2c::ERROR_OK) {
-              bool timer_active = v67 & 0x40;
-              ESP_LOGI("PMU_READ", "REG 67: 0x%02X (Timer aktiv: %s)", v67, timer_active ? "JA" : "NEIN");
-            }
     - priority: -100
       then:
-        - script.execute: display_timer # Startet den Timer direkt beim Start
+        - script.execute: display_timer 
     
     - priority: -200
       then:
@@ -296,7 +269,12 @@ font:
     id: arial_font_14
     size: 16
     glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
-    
+  
+  - file: "_fonts/arial.ttf"
+    id: arial_font_extra_small
+    size: 14
+    glyphs: 'ß!?"%()+*=,-_.:°ø0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZÄÜÖ abcdefghijklmnopqrstuvwxyzäüö€@<>/&|'
+        
 text_sensor:
   - platform: template
     id: last_ean
@@ -395,15 +373,20 @@ text_sensor:
     id: uptime_human
     icon: "mdi:clock-start"      
 
+  - platform: template
+    name: "PMU Interner Kapazitätswert"
+    id: pmu_internal_value
+    icon: "mdi:memory"
+
 sensor:
-  # 1. Die Standard-Sensoren vom AXP2101
+  # 1. Hardware-Werte vom Chip (Nur zur Info)
   - platform: axp2101
-    battery_level:
-      name: "Batterie Prozent"
-      id: batterie_ladestand  # <--- ID für das Display-Lambda
     battery_voltage:
       name: "Batterie Spannung"
       id: batt_voltage
+    battery_level:
+      name: "Batterie Prozent (Chip)"
+      id: batt_level_raw
 
   # 2. Dein manuelles Ladelimit
   - platform: template
@@ -493,7 +476,35 @@ sensor:
               return (days > 0 ? std::to_string(days) + "d " : "") +
                      (hours > 0 ? std::to_string(hours) + "h " : "") +
                      std::to_string(minutes) + "m";
+                     
+# 2. DIE LÖSUNG: Software-Berechnung für dein Display
+  - platform: template
+    name: "Batterie Prozent"
+    id: batterie_ladestand  # <--- Diese ID nutzt dein Display-Lambda!
+    unit_of_measurement: "%"
+    device_class: battery
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(batt_voltage).state;
+      if (isnan(v) || v < 2.0) return NAN;
+      
+      // Li-Ion Entladekurve: 
+      // 4.1V = 100%
+      // 3.4V = 0% (Sicherheitsabschaltung meist bei 3.2V-3.3V)
+      if (v >= 4.10) return 100.0;
+      if (v <= 3.40) return 0.0;
+      
+      // Lineare Skalierung:
+      float pct = (v - 3.4) / (4.1 - 3.4) * 100.0;
+      return pct;
 
+  # 3. Den "Design Capacity Check" kannst du jetzt entfernen oder so lassen:
+  - platform: template
+    name: "Eingestellte Kapazität"
+    update_interval: 60s
+    lambda: |-
+      return 72.0; // Wir wissen jetzt: Der Chip lässt nur 72mAh zu.
 
 # Nicht vergessen: Den Ladesensor für das "+" im Display brauchen wir auch noch
 binary_sensor:
@@ -626,51 +637,46 @@ display:
       
       // --- HEADER (45px hoch) ---
       it.filled_rectangle(0, 0, screen_width, 45, Color(40, 40, 40)); 
-      it.print(10, 8, id(arial_font_18), Color(255, 255, 255), TextAlign::TOP_LEFT, "BARCODE SCANNER");
+      
+      // 1. Titel "Barcode Scanner" zentral (kleinere Schriftart)
+      it.print(x_center, 12, id(arial_font), Color(255, 255, 255), TextAlign::TOP_CENTER, "Barcode Scanner");
 
-      // --- BATTERIE & PROZENT ---
+      // 2. WLAN SYMBOL (Links)
+      int wifi_x = 22; 
+      int wifi_y = 25; // Leicht nach oben korrigiert
+      Color wifi_color = id(system_status).state ? Color(0, 255, 0) : Color(255, 0, 0);
+      it.filled_circle(wifi_x, wifi_y, 2, wifi_color); 
+      it.circle(wifi_x, wifi_y, 7, wifi_color);        
+      it.circle(wifi_x, wifi_y, 12, wifi_color);       
+      it.filled_rectangle(wifi_x - 15, wifi_y + 1, 30, 15, Color(40, 40, 40)); 
+
+      // 3. HA SYMBOL
+      int ha_x = 55;
+      int ha_y = 12; // Leicht nach oben korrigiert
+      Color ha_color = id(api_ready) ? Color(0, 255, 255) : Color(255, 165, 0);
+      it.line(ha_x, ha_y, ha_x - 7, ha_y + 7, ha_color); 
+      it.line(ha_x, ha_y, ha_x + 7, ha_y + 7, ha_color);
+      it.rectangle(ha_x - 4, ha_y + 7, 9, 7, ha_color); 
+
+      // 4. BATTERIE-KOMBI (Ganz rechts)
       if (id(batterie_ladestand).has_state()) {
         float level = id(batterie_ladestand).state;
-        float threshold = id(akku_warnschwelle).has_state() ? id(akku_warnschwelle).state : 15.0; 
-        Color batt_color = Color(0, 255, 0);
+        Color batt_color = (level < 20.0) ? Color(255, 0, 0) : Color(0, 255, 0);
         
-        if (level < threshold) {
-          batt_color = Color(255, 0, 0);
-        } else if (level < 50.0) {
-          batt_color = Color(255, 165, 0);
+        int batt_x = screen_width - 35;
+        int y_pos_icon = 8; // Batteriesymbol nach oben gerückt
+        
+        // Batterie-Icon verkleinert
+        it.rectangle(batt_x, y_pos_icon, 22, 10, batt_color);
+        it.filled_rectangle(batt_x + 22, y_pos_icon + 3, 2, 4, batt_color);
+        int fill_w = (int)((level / 100.0) * 18);
+        if (fill_w > 0) {
+          it.filled_rectangle(batt_x + 2, y_pos_icon + 2, fill_w, 6, batt_color);
         }
 
-        bool blink_off = (level < threshold) && !id(batterie_laden).state && ((millis() / 500) % 2 == 0);
-
-        if (!blink_off) {
-          int perc_x = screen_width - 5; 
-          int batt_x = screen_width - 105; 
-          int y_pos = 15; 
-          it.printf(perc_x, 10, id(arial_font), batt_color, TextAlign::TOP_RIGHT, "%.0f%%", level);
-          int b_width = 28;
-          int b_height = 14;
-          it.rectangle(batt_x, y_pos, b_width, b_height, batt_color);
-          it.filled_rectangle(batt_x + b_width, y_pos + 4, 2, 6, batt_color);
-          
-          int fill_w;
-          if (id(batterie_laden).state) {
-            int animation_step = (millis() % 2000) / 20; 
-            fill_w = (int)((animation_step / 100.0) * (b_width - 4));
-          } else {
-            fill_w = (int)((level / 100.0) * (b_width - 4));
-          }
-          if (fill_w > 0) {
-            it.filled_rectangle(batt_x + 2, y_pos + 2, fill_w, b_height - 4, batt_color);
-          }
-          if (id(batterie_laden).state) {
-            Color bolt_color = Color(255, 255, 255);
-            int bx = batt_x + 10;
-            int by = y_pos + 2;
-            it.line(bx + 4, by, bx + 1, by + 6, bolt_color);         
-            it.line(bx + 1, by + 5, bx + 5, by + 5, bolt_color);    
-            it.line(bx + 5, by + 4, bx + 2, by + 10, bolt_color);   
-          }
-        }
+        // Prozentanzeige (Zentriert UNTER dem Symbol, kleine Schrift)
+        // Nutzt id(arial_font) für kleine Darstellung
+        it.printf(batt_x + 11, y_pos_icon + 12, id(arial_font_extra_small), batt_color, TextAlign::TOP_CENTER, "%.0f%%", level);
       }
 
       it.line(0, 45, screen_width, 45, Color(255, 255, 255));
@@ -682,45 +688,28 @@ display:
         std::string ean_status = id(last_ean).state;
         std::string prod_status = id(last_product).state;
         
-        // 1. ZUSTAND: STANDBY
         if (ean_status == "Bereit zum Scannen" || ean_status.empty() || ean_status == "unknown") {
           it.print(x_center, 150, id(arial_font_18), Color(0,255,0), TextAlign::CENTER, "SCANNER BEREIT");
           it.print(x_center, 190, id(arial_font), Color(150,150,150), TextAlign::CENTER, "Warte auf Barcode...");
         } 
-        
-        // 2. ZUSTAND: SCAN ERFOLGT, SUCHE LÄUFT
         else if (prod_status == "EAN erkannt - suche Daten") {
           it.print(x_center, 140, id(arial_font_18), Color(0,255,255), TextAlign::CENTER, "EAN erkannt");
           it.print(x_center, 180, id(arial_font), Color(255,255,255), TextAlign::CENTER, "suche Daten...");
         }
-        
-        // 3. ZUSTAND: PRODUKT GEFUNDEN (ODER FEHLERMELDUNG VON HA)
         else {
-          // Grüner Rahmen um den Datenbereich
-          it.rectangle(5, 50, screen_width - 10, 260, Color(0, 255, 0));
-          
-          // EAN (Grau)
+          it.rectangle(5, 50, screen_width - 10, 210, Color(0, 255, 0)); // Höhe angepasst
           it.printf(x_center, 60, id(arial_font_14), Color(150,150,150), TextAlign::TOP_CENTER, "EAN: %s", ean_status.c_str());
-          
-          // Marke (Gelb)
           it.print(x_center, 85, id(arial_font_18), Color(255,255,0), TextAlign::TOP_CENTER, id(last_brand).state.c_str());
-          
-          // Produktname (Weiß, Groß & Fett)
           it.print(x_center, 125, id(arial_font_bold), Color(255,255,255), TextAlign::TOP_CENTER, id(last_product).state.c_str());
           
-          // Gewicht
           if (!id(last_weight).state.empty() && id(last_weight).state != "unknown") {
             it.print(x_center, 180, id(arial_font), Color(200,200,200), TextAlign::TOP_CENTER, id(last_weight).state.c_str());
           }
-
-          // Restbestand (Grün)
           if (!id(last_stock).state.empty() && id(last_stock).state != "unknown") {
-             it.printf(x_center, 225, id(arial_font_18), Color(0,255,0), TextAlign::TOP_CENTER, "Restbestand: %s", id(last_stock).state.c_str());
+            it.printf(x_center, 225, id(arial_font_18), Color(0,255,0), TextAlign::TOP_CENTER, "Rest: %s", id(last_stock).state.c_str());
           }
-          
-          // Mindestbestand (Cyan) - Hier wird die kcal ID zweckentfremdet
           if (!id(last_kcal).state.empty() && id(last_kcal).state != "unknown") {
-            it.printf(x_center, 270, id(arial_font_18), Color(0,255,255), TextAlign::TOP_CENTER, "Mindestbestand: %s", id(last_kcal).state.c_str());
+            it.printf(x_center, 270, id(arial_font_18), Color(0,255,255), TextAlign::TOP_CENTER, "Min: %s", id(last_kcal).state.c_str());
           }
         }
       }
