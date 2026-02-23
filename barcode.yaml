@@ -38,9 +38,14 @@ esphome:
               id(bus_a).write(0x34, t_off, 2);
             }
 
-            // 4. Power & ADC
-            id(bus_a).write(0x34, (uint8_t[]){0x90, 0xFF}, 2);
-            id(bus_a).write(0x34, (uint8_t[]){0x30, 0xFF}, 2);
+            // 4. Power-Schienen & ADC aktivieren
+            uint8_t pwr_en[2] = {0x90, 0xFF};
+            id(bus_a).write(0x34, pwr_en, 2);
+            
+            uint8_t adc_en[2] = {0x30, 0xFF};
+            id(bus_a).write(0x34, adc_en, 2);
+            
+            ESP_LOGI("PMU", "Initialisierung abgeschlossen.");
 
     - priority: -100
       then:
